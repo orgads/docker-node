@@ -2,6 +2,7 @@ FROM alpine:3.14
 
 ENV NODE_VERSION 16.13.0
 
+COPY async-revert.patch /
 RUN addgroup -g 1000 node \
     && adduser -u 1000 -G node -s /bin/sh -D node \
     && apk add --no-cache \
@@ -12,7 +13,6 @@ RUN addgroup -g 1000 node \
       && case "${alpineArch##*-}" in \
         x86_64) \
           ARCH='x64' \
-          CHECKSUM="f78b7f49c92559855d7804b67101a0da393ad75950317c9138a15cd05292f7a6" \
           ;; \
         *) ;; \
       esac \
@@ -33,6 +33,7 @@ RUN addgroup -g 1000 node \
         libgcc \
         linux-headers \
         make \
+        patch \
         python3 \
     # gpg keys listed at https://github.com/nodejs/node#release-keys
     && for key in \
@@ -57,6 +58,8 @@ RUN addgroup -g 1000 node \
     && grep " node-v$NODE_VERSION.tar.xz\$" SHASUMS256.txt | sha256sum -c - \
     && tar -xf "node-v$NODE_VERSION.tar.xz" \
     && cd "node-v$NODE_VERSION" \
+    && patch -p1 < /async-revert.patch \
+    && rm -f /async-revert.patch \
     && ./configure \
     && make -j$(getconf _NPROCESSORS_ONLN) V= \
     && make install \

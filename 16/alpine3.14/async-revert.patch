@@ -1,0 +1,337 @@
+From 1d556e6340985b6600929ed2ee7aebc0c52a31bf Mon Sep 17 00:00:00 2001
+From: Darshan Sen <darshan.sen@postman.com>
+Date: Sat, 13 Nov 2021 13:12:15 +0530
+Subject: [PATCH] async_hooks: unmerge resource_symbol from owner_symbol
+
+This reverts commits 937bbc5571073d1fbeffd2d9e18949b3b4dcf09b
+and 7ca2f1303996e0c79c354e979a1527da444ca886.
+---
+ lib/_http_agent.js                            |  2 +-
+ lib/internal/async_hooks.js                   | 12 +++---
+ lib/internal/js_stream_socket.js              | 39 +++----------------
+ lib/internal/stream_base_commons.js           | 13 +------
+ lib/net.js                                    |  6 +--
+ src/async_wrap.cc                             |  4 +-
+ src/env.h                                     |  1 +
+ .../test-async-local-storage-dgram.js         | 26 +++++++++++++
+ .../test-async-local-storage-socket.js        | 27 +++++++++++++
+ .../test-async-local-storage-tlssocket.js     | 36 +++++++++++++++++
+ .../test-http-agent-handle-reuse-parallel.js  |  2 +
+ .../test-http-agent-handle-reuse-serial.js    |  2 +
+ 12 files changed, 110 insertions(+), 60 deletions(-)
+ create mode 100644 test/async-hooks/test-async-local-storage-dgram.js
+ create mode 100644 test/async-hooks/test-async-local-storage-socket.js
+ create mode 100644 test/async-hooks/test-async-local-storage-tlssocket.js
+
+diff --git a/lib/_http_agent.js b/lib/_http_agent.js
+index 87450993a6..9c15875762 100644
+--- a/lib/_http_agent.js
++++ b/lib/_http_agent.js
+@@ -525,7 +525,7 @@ function asyncResetHandle(socket) {
+   const handle = socket._handle;
+   if (handle && typeof handle.asyncReset === 'function') {
+     // Assign the handle a new asyncId and run any destroy()/init() hooks.
+-    handle.asyncReset(new ReusedHandle(handle.getProviderType(), socket));
++    handle.asyncReset(new ReusedHandle(handle.getProviderType(), handle));
+     socket[async_id_symbol] = handle.getAsyncId();
+   }
+ }
+diff --git a/lib/internal/async_hooks.js b/lib/internal/async_hooks.js
+index 8608d6d1a7..17cdabbd28 100644
+--- a/lib/internal/async_hooks.js
++++ b/lib/internal/async_hooks.js
+@@ -81,7 +81,7 @@ const active_hooks = {
+ 
+ const { registerDestroyHook } = async_wrap;
+ const { enqueueMicrotask } = internalBinding('task_queue');
+-const { owner_symbol } = internalBinding('symbols');
++const { resource_symbol, owner_symbol } = internalBinding('symbols');
+ 
+ // Each constant tracks how many callbacks there are for any given step of
+ // async execution. These are tracked so if the user didn't include callbacks
+@@ -176,13 +176,11 @@ function fatalError(e) {
+ 
+ function lookupPublicResource(resource) {
+   if (typeof resource !== 'object' || resource === null) return resource;
+-
+-  const publicResource = resource[owner_symbol];
+-
+-  if (publicResource != null) {
++  // TODO(addaleax): Merge this with owner_symbol and use it across all
++  // AsyncWrap instances.
++  const publicResource = resource[resource_symbol];
++  if (publicResource !== undefined)
+     return publicResource;
+-  }
+-
+   return resource;
+ }
+ 
+diff --git a/lib/internal/js_stream_socket.js b/lib/internal/js_stream_socket.js
+index bd90241256..faad988e82 100644
+--- a/lib/internal/js_stream_socket.js
++++ b/lib/internal/js_stream_socket.js
+@@ -22,44 +22,15 @@ const kCurrentWriteRequest = Symbol('kCurrentWriteRequest');
+ const kCurrentShutdownRequest = Symbol('kCurrentShutdownRequest');
+ const kPendingShutdownRequest = Symbol('kPendingShutdownRequest');
+ 
+-function checkReusedHandle(self) {
+-  let socket = self[owner_symbol];
++function isClosing() { return this[owner_symbol].isClosing(); }
+ 
+-  if (socket.constructor.name === 'ReusedHandle')
+-    socket = socket.handle;
++function onreadstart() { return this[owner_symbol].readStart(); }
+ 
+-  return socket;
+-}
+-
+-function isClosing() {
+-  const socket = checkReusedHandle(this);
+-
+-  return socket.isClosing();
+-}
+-
+-function onreadstart() {
+-  const socket = checkReusedHandle(this);
+-
+-  return socket.readStart();
+-}
++function onreadstop() { return this[owner_symbol].readStop(); }
+ 
+-function onreadstop() {
+-  const socket = checkReusedHandle(this);
++function onshutdown(req) { return this[owner_symbol].doShutdown(req); }
+ 
+-  return socket.readStop();
+-}
+-
+-function onshutdown(req) {
+-  const socket = checkReusedHandle(this);
+-
+-  return socket.doShutdown(req);
+-}
+-
+-function onwrite(req, bufs) {
+-  const socket = checkReusedHandle(this);
+-
+-  return socket.doWrite(req, bufs);
+-}
++function onwrite(req, bufs) { return this[owner_symbol].doWrite(req, bufs); }
+ 
+ /* This class serves as a wrapper for when the C++ side of Node wants access
+  * to a standard JS stream. For example, TLS or HTTP do not operate on network
+diff --git a/lib/internal/stream_base_commons.js b/lib/internal/stream_base_commons.js
+index 13b5f541cb..5254fc1553 100644
+--- a/lib/internal/stream_base_commons.js
++++ b/lib/internal/stream_base_commons.js
+@@ -80,11 +80,7 @@ function handleWriteReq(req, data, encoding) {
+ function onWriteComplete(status) {
+   debug('onWriteComplete', status, this.error);
+ 
+-  let stream = this.handle[owner_symbol];
+-
+-  if (stream.constructor.name === 'ReusedHandle') {
+-    stream = stream.handle;
+-  }
++  const stream = this.handle[owner_symbol];
+ 
+   if (stream.destroyed) {
+     if (typeof this.callback === 'function')
+@@ -172,12 +168,7 @@ function onStreamRead(arrayBuffer) {
+   const nread = streamBaseState[kReadBytesOrError];
+ 
+   const handle = this;
+-
+-  let stream = this[owner_symbol];
+-
+-  if (stream.constructor.name === 'ReusedHandle') {
+-    stream = stream.handle;
+-  }
++  const stream = this[owner_symbol];
+ 
+   stream[kUpdateTimer]();
+ 
+diff --git a/lib/net.js b/lib/net.js
+index 41ff284e1e..3bbe96f1e0 100644
+--- a/lib/net.js
++++ b/lib/net.js
+@@ -1117,11 +1117,7 @@ Socket.prototype.unref = function() {
+ 
+ 
+ function afterConnect(status, handle, req, readable, writable) {
+-  let self = handle[owner_symbol];
+-
+-  if (self.constructor.name === 'ReusedHandle') {
+-    self = self.handle;
+-  }
++  const self = handle[owner_symbol];
+ 
+   // Callback may come after call to destroy
+   if (self.destroyed) {
+diff --git a/src/async_wrap.cc b/src/async_wrap.cc
+index 8ed8ce11d8..d5a62951a7 100644
+--- a/src/async_wrap.cc
++++ b/src/async_wrap.cc
+@@ -313,7 +313,7 @@ void AsyncWrap::EmitDestroy(bool from_gc) {
+ 
+   if (!persistent().IsEmpty() && !from_gc) {
+     HandleScope handle_scope(env()->isolate());
+-    USE(object()->Set(env()->context(), env()->owner_symbol(), object()));
++    USE(object()->Set(env()->context(), env()->resource_symbol(), object()));
+   }
+ }
+ 
+@@ -589,7 +589,7 @@ void AsyncWrap::AsyncReset(Local<Object> resource, double execution_async_id,
+     Local<Object> obj = object();
+     CHECK(!obj.IsEmpty());
+     if (resource != obj) {
+-      USE(obj->Set(env()->context(), env()->owner_symbol(), resource));
++      USE(obj->Set(env()->context(), env()->resource_symbol(), resource));
+     }
+   }
+ 
+diff --git a/src/env.h b/src/env.h
+index c0712d4881..5cf789f9bb 100644
+--- a/src/env.h
++++ b/src/env.h
+@@ -171,6 +171,7 @@ constexpr size_t kFsStatsBufferLength =
+   V(oninit_symbol, "oninit")                                                   \
+   V(owner_symbol, "owner_symbol")                                              \
+   V(onpskexchange_symbol, "onpskexchange")                                     \
++  V(resource_symbol, "resource_symbol")                                        \
+   V(trigger_async_id_symbol, "trigger_async_id_symbol")                        \
+ 
+ // Strings are per-isolate primitives but Environment proxies them
+diff --git a/test/async-hooks/test-async-local-storage-dgram.js b/test/async-hooks/test-async-local-storage-dgram.js
+new file mode 100644
+index 0000000000..a68ae63643
+--- /dev/null
++++ b/test/async-hooks/test-async-local-storage-dgram.js
+@@ -0,0 +1,26 @@
++'use strict';
++
++require('../common');
++
++// Regression tests for https://github.com/nodejs/node/issues/40693
++
++const assert = require('assert');
++const dgram = require('dgram');
++const { AsyncLocalStorage } = require('async_hooks');
++
++dgram.createSocket('udp4')
++  .on('message', function(msg, rinfo) { this.send(msg, rinfo.port); })
++  .on('listening', function() {
++    const asyncLocalStorage = new AsyncLocalStorage();
++    const store = { val: 'abcd' };
++    asyncLocalStorage.run(store, () => {
++      const client = dgram.createSocket('udp4');
++      client.on('message', (msg, rinfo) => {
++        assert.deepStrictEqual(asyncLocalStorage.getStore(), store);
++        client.close();
++        this.close();
++      });
++      client.send('Hello, world!', this.address().port);
++    });
++  })
++  .bind(0);
+diff --git a/test/async-hooks/test-async-local-storage-socket.js b/test/async-hooks/test-async-local-storage-socket.js
+new file mode 100644
+index 0000000000..337b4073df
+--- /dev/null
++++ b/test/async-hooks/test-async-local-storage-socket.js
+@@ -0,0 +1,27 @@
++'use strict';
++
++require('../common');
++
++// Regression tests for https://github.com/nodejs/node/issues/40693
++
++const assert = require('assert');
++const net = require('net');
++const { AsyncLocalStorage } = require('async_hooks');
++
++net
++  .createServer((socket) => {
++    socket.write('Hello, world!');
++    socket.pipe(socket);
++  })
++  .listen(0, function() {
++    const asyncLocalStorage = new AsyncLocalStorage();
++    const store = { val: 'abcd' };
++    asyncLocalStorage.run(store, () => {
++      const client = net.connect({ port: this.address().port });
++      client.on('data', () => {
++        assert.deepStrictEqual(asyncLocalStorage.getStore(), store);
++        client.end();
++        this.close();
++      });
++    });
++  });
+diff --git a/test/async-hooks/test-async-local-storage-tlssocket.js b/test/async-hooks/test-async-local-storage-tlssocket.js
+new file mode 100644
+index 0000000000..34ea4c0682
+--- /dev/null
++++ b/test/async-hooks/test-async-local-storage-tlssocket.js
+@@ -0,0 +1,36 @@
++'use strict';
++
++const common = require('../common');
++if (!common.hasCrypto)
++  common.skip('missing crypto');
++
++// Regression tests for https://github.com/nodejs/node/issues/40693
++
++const assert = require('assert');
++const fixtures = require('../common/fixtures');
++const tls = require('tls');
++const { AsyncLocalStorage } = require('async_hooks');
++
++const options = {
++  cert: fixtures.readKey('rsa_cert.crt'),
++  key: fixtures.readKey('rsa_private.pem'),
++  rejectUnauthorized: false
++};
++
++tls
++  .createServer(options, (socket) => {
++    socket.write('Hello, world!');
++    socket.pipe(socket);
++  })
++  .listen(0, function() {
++    const asyncLocalStorage = new AsyncLocalStorage();
++    const store = { val: 'abcd' };
++    asyncLocalStorage.run(store, () => {
++      const client = tls.connect({ port: this.address().port, ...options });
++      client.on('data', () => {
++        assert.deepStrictEqual(asyncLocalStorage.getStore(), store);
++        client.end();
++        this.close();
++      });
++    });
++  });
+diff --git a/test/async-hooks/test-http-agent-handle-reuse-parallel.js b/test/async-hooks/test-http-agent-handle-reuse-parallel.js
+index a7d76a694b..cd73b3ed2c 100644
+--- a/test/async-hooks/test-http-agent-handle-reuse-parallel.js
++++ b/test/async-hooks/test-http-agent-handle-reuse-parallel.js
+@@ -87,4 +87,6 @@ function onExit() {
+   // Verify reuse handle has been wrapped
+   assert.strictEqual(first.type, second.type);
+   assert.ok(first.handle !== second.handle, 'Resource reused');
++  assert.ok(first.handle === second.handle.handle,
++            'Resource not wrapped correctly');
+ }
+diff --git a/test/async-hooks/test-http-agent-handle-reuse-serial.js b/test/async-hooks/test-http-agent-handle-reuse-serial.js
+index 2ee118bb24..bbc7183d6e 100644
+--- a/test/async-hooks/test-http-agent-handle-reuse-serial.js
++++ b/test/async-hooks/test-http-agent-handle-reuse-serial.js
+@@ -105,4 +105,6 @@ function onExit() {
+   // Verify reuse handle has been wrapped
+   assert.strictEqual(first.type, second.type);
+   assert.ok(first.handle !== second.handle, 'Resource reused');
++  assert.ok(first.handle === second.handle.handle,
++            'Resource not wrapped correctly');
+ }
+-- 
+2.29.2
+
